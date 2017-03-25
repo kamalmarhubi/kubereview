@@ -1,0 +1,7 @@
+apiVersion: extensions/v1beta1
+kind: ThirdPartyResource
+metadata:
+  name: kubereview-deployment.kamalmarhubi.com
+description: "An instance of an application for review"
+versions:
+- name: v1
