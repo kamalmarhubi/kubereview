@@ -1,0 +1,14 @@
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: nginx-example
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+  - host: nginx-example.k8s.kamal.cloud
+    http:
+      paths:
+      - backend:
+          serviceName: nginx-example
+          servicePort: 80
