@@ -36,6 +36,7 @@ const (
 	KubeReviewDomain                    = "kubereview.kamalmarhubi.com"
 	ReviewDeploymentResourceDescription = "An instance of an application for review"
 	ReviewDeploymentResourceGroup       = KubeReviewDomain
+	ReviewDeploymentLabel = KubeReviewDomain + "/" + "reviewdeployment"
 
 	ReviewDeploymentResourcePath         = "reviewdeployments"
 	ReviewDeploymentResourceName         = "review-deployment." + KubeReviewDomain
@@ -122,7 +123,7 @@ func main() {
 		}
 
 		toCreate := b.Pod()
-		pod, e := clientset.CoreV1().Pods(api.NamespaceDefault).Create(&toCreate)
+		pod, e := clientset.CoreV1().Pods(api.NamespaceDefault).Create(toCreate)
 
 		if e != nil {
 			log.Print(e)
@@ -147,7 +148,7 @@ type buildJob struct {
 	repo, zipURL, buildContextDir, imageName, imageTag string
 }
 
-func (b *buildJob) Pod() apiv1.Pod {
+func (b *buildJob) Pod() *apiv1.Pod {
 	initContainers, _ := json.Marshal([]apiv1.Container{
 		{
 			Name:            "download",
@@ -163,7 +164,7 @@ func (b *buildJob) Pod() apiv1.Pod {
 		},
 	})
 
-	return apiv1.Pod{
+	return &apiv1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: fmt.Sprintf("kubereview-build-%s-", strings.Replace(b.repo, "/", "--", -1)),
 			Annotations: map[string]string{
@@ -248,20 +249,30 @@ func createThirdPartyResourceIfMissing(clientset *kubernetes.Clientset) {
 //    https://github.com/kubernetes/client-go/blob/76153773eaa3a268131d3d993290a194a1370585/examples/third-party-resources/types.go
 type ReviewDeploymentSpec struct {
 	Repo            string  `json:"repo"`
-	Ref             bool    `json:"ref"`
+	PullRequestID   int     `json:"pullRequest"`
+	Ref             string  `json:"ref"`
 	BuildContextDir *string `json:"buildContextDir,omitempty"`
+}
+
+type ReviewDeploymentStatus struct {
+	BuildPod string `json:"buildPod,omitempty"`
+	Image string `json:"image,omitempty"`
+	Pod string `json:"pod,omitempty"`
+	Service string `json:"service,omitempty"`
+	Ingress string `json:"ingress,omitempty"`
 }
 
 type ReviewDeployment struct {
 	metav1.TypeMeta `json:",inline"`
-	Metadata        metav1.ObjectMeta `json:"metadata"`
+  metav1.ObjectMeta `json:"metadata"`
 
 	Spec ReviewDeploymentSpec `json:"spec"`
+	Status ReviewDeploymentStatus `json:"status,omitempty"`
 }
 
 type ReviewDeploymentList struct {
 	metav1.TypeMeta `json:",inline"`
-	Metadata        metav1.ListMeta `json:"metadata"`
+	metav1.ListMeta `json:"metadata"`
 
 	Items []ReviewDeployment `json:"items"`
 }
@@ -273,7 +284,7 @@ func (e *ReviewDeployment) GetObjectKind() schema.ObjectKind {
 
 // Required to satisfy ObjectMetaAccessor interface
 func (e *ReviewDeployment) GetObjectMeta() metav1.Object {
-	return &e.Metadata
+	return &e.ObjectMeta
 }
 
 // Required to satisfy Object interface
@@ -283,7 +294,7 @@ func (el *ReviewDeploymentList) GetObjectKind() schema.ObjectKind {
 
 // Required to satisfy ListMetaAccessor interface
 func (el *ReviewDeploymentList) GetListMeta() metav1.List {
-	return &el.Metadata
+	return &el.ListMeta
 }
 
 // Adapted from https://github.com/nilebox/kubernetes/blob/7891fbbdf6f399be07f2b19e1114346dab07b7b4/staging/src/k8s.io/client-go/examples/third-party-resources/watcher.go
@@ -299,7 +310,10 @@ func (w *Watcher) Run(ctx context.Context) error {
 	fmt.Printf("Watch ReviewDeployment objects\n")
 
 	// Watch Example objects
-	handler := ReviewDeploymentEventHandler{}
+	handler := eventHandler{
+		clientset: w.clientset,
+		rdClient: w.reviewDeploymentClient,
+	}
 	_, err := watchReviewDeployments(ctx, w.reviewDeploymentClient, w.reviewDeploymentScheme, &handler)
 	if err != nil {
 		fmt.Printf("Failed to register watch for ReviewDeployment resource: %v\n", err)
@@ -377,24 +391,90 @@ func newListWatchFromClient(c cache.Getter, resource string, namespace string, f
 }
 
 // ReviewDeploymentEventHandler can handle events for ReviewDeployment resource
-type ReviewDeploymentEventHandler struct {
+type ReviewDeploymentEventHandler interface {
+	OnAdd(obj interface{})
+	OnUpdate(oldObj, newObj interface{})
+	OnDelete(obj interface{})
 }
 
-func (h *ReviewDeploymentEventHandler) OnAdd(obj interface{}) {
+type eventHandler struct {
+	clientset              *kubernetes.Clientset
+	rdClient *rest.RESTClient
+}
+
+func NewBuildPod(rd *ReviewDeployment) *apiv1.Pod {
+	log.Printf("rd=%v", *rd)
+	var contextDir string
+	if rd.Spec.BuildContextDir != nil {
+		contextDir = *rd.Spec.BuildContextDir
+	}
+	b := buildJob{
+		repo: rd.Spec.Repo,
+		zipURL: fmt.Sprintf("https://github.com/%s/archive/%s.zip", rd.Spec.Repo, rd.Spec.Ref),
+		imageName: fmt.Sprintf(
+			"%v-pr%v",
+			strings.Replace(rd.Spec.Repo, "/", "--", -1),
+			rd.Spec.PullRequestID,
+		),
+		imageTag: rd.Spec.Ref,
+		buildContextDir: contextDir,
+	}
+
+	pod := b.Pod()
+	if pod.Labels == nil {
+		pod.Labels = make(map[string]string)
+	}
+	pod.Labels[ReviewDeploymentLabel] = rd.Name
+
+	return pod
+}
+
+func (h *eventHandler) OnAdd(obj interface{}) {
+	rd := obj.(*ReviewDeployment)
+	fmt.Printf("[WATCH] OnAdd %s\n", rd.SelfLink)
+
+	if rd.Status.Image == "" && rd.Status.BuildPod == "" {
+		toCreate := NewBuildPod(rd)
+		log.Printf("Creating build pod: %v", *toCreate)
+		pod, err := h.clientset.CoreV1().Pods(api.NamespaceDefault).Create(toCreate)
+
+		if err != nil {
+			log.Printf("Error creating build pod: %v", err)
+			return
+		}
+		log.Printf("Created %v", pod.SelfLink)
+		rd.Status.BuildPod = pod.SelfLink
+
+		var result ReviewDeployment
+
+		req := h.rdClient.Put().
+		Resource(ReviewDeploymentResourcePath).
+		Namespace(api.NamespaceDefault).
+		Name(rd.Name).
+		Body(rd)
+		err = req.Do().Into(&result)
+		if err != nil {
+			// TODO: Concurrency here.
+			log.Printf("SOMETHING WENT WRONG, %v", err)
+		}
+		log.Printf("updated %v", result)
+	} else {
+		log.Printf("Already built: %v", rd.SelfLink)
+	}
+}
+
+// TODO we probably don't care about updates?
+func (h *eventHandler) OnUpdate(oldObj, newObj interface{}) {
+	oldRd := oldObj.(*ReviewDeployment)
+	newRd := newObj.(*ReviewDeployment)
+	if newRd.Status.Image == "" && newRd.Status.BuildPod == "" {
+		log.Printf("why did we get here? %v", oldRd.SelfLink)
+	}
+}
+
+func (h *eventHandler) OnDelete(obj interface{}) {
 	reviewDeployment := obj.(*ReviewDeployment)
-	fmt.Printf("[WATCH] OnAdd %s\n", reviewDeployment.Metadata.SelfLink)
-}
-
-func (h *ReviewDeploymentEventHandler) OnUpdate(oldObj, newObj interface{}) {
-	oldReviewDeployment := oldObj.(*ReviewDeployment)
-	newReviewDeployment := newObj.(*ReviewDeployment)
-	fmt.Printf("[WATCH] OnUpdate oldObj: %s\n", oldReviewDeployment.Metadata.SelfLink)
-	fmt.Printf("[WATCH] OnUpdate newObj: %s\n", newReviewDeployment.Metadata.SelfLink)
-}
-
-func (h *ReviewDeploymentEventHandler) OnDelete(obj interface{}) {
-	reviewDeployment := obj.(*ReviewDeployment)
-	fmt.Printf("[WATCH] OnDelete %s\n", reviewDeployment.Metadata.SelfLink)
+	fmt.Printf("[WATCH] OnDelete %s\n", reviewDeployment.SelfLink)
 }
 
 // Adapted from
