@@ -10,4 +10,4 @@ unset dir
 # GitHub zip files always have an inner directory with a name based on repo /
 # ref. Assume it's the only one and give it a known name.
 dir="$(ls /tmp/extracted)"
-mv "/tmp/extracted/$dir" /workspace/src
+mv "/tmp/extracted/$dir" "$WORKSPACE"
