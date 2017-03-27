@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/watch"
 
 	"k8s.io/client-go/kubernetes"
@@ -224,7 +225,7 @@ func createThirdPartyResourceIfMissing(clientset *kubernetes.Clientset) {
 		Get(ReviewDeploymentResourceName, metav1.GetOptions{})
 
 	if err == nil {
-		log.Printf("Third party resource already exists %#v\n", tpr)
+		log.Printf("Third party resource %v already exists", tpr.Name)
 	} else {
 		if !errors.IsNotFound(err) {
 			log.Fatalf("Error checking for third party resource: %v", err)
@@ -424,7 +425,7 @@ func (rd *ReviewDeployment) BuildJob() *buildJob {
 	}
 }
 
-func NewBuildPod(rd *ReviewDeployment) *apiv1.Pod {
+func (rd *ReviewDeployment) BuildPod() *apiv1.Pod {
 	b := rd.BuildJob()
 
 	pod := b.Pod()
@@ -434,6 +435,68 @@ func NewBuildPod(rd *ReviewDeployment) *apiv1.Pod {
 	pod.Labels[ReviewDeploymentLabel] = rd.Name
 
 	return pod
+}
+
+func (rd *ReviewDeployment) Pod() *apiv1.Pod {
+	return &apiv1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: rd.Name,
+			Labels: map[string]string{ReviewDeploymentLabel: rd.Name},
+		},
+		Spec: apiv1.PodSpec{
+			// TODO ActiveDeadlineSeconds: ActiveDeadlineSeconds,
+			RestartPolicy: apiv1.RestartPolicyNever,
+			Containers: []apiv1.Container{
+				apiv1.Container{
+					Name: "main",
+					Image:           rd.Status.Image,
+					ImagePullPolicy: apiv1.PullAlways,
+				},
+			},
+		},
+	}
+}
+
+func (rd *ReviewDeployment) Service() *apiv1.Service {
+	return &apiv1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: rd.Name,
+			Labels: map[string]string{ReviewDeploymentLabel: rd.Name},
+		},
+		Spec: apiv1.ServiceSpec{
+			Ports: []apiv1.ServicePort{{
+				Port: 80,
+				Protocol: apiv1.ProtocolTCP,
+				TargetPort: intstr.FromInt(80),
+			}},
+			Selector: map[string]string{ReviewDeploymentLabel: rd.Name},
+		},
+	}
+}
+
+func (rd *ReviewDeployment) Ingress() *v1beta1.Ingress {
+	return &v1beta1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: rd.Name,
+			Annotations: map[string]string{"kubernetes.io/ingress.class": "nginx"},
+			Labels: map[string]string{ReviewDeploymentLabel: rd.Name},
+		},
+		Spec: v1beta1.IngressSpec{
+			Rules: []v1beta1.IngressRule{{
+				Host: fmt.Sprintf("%v.kubereview.k8s.kamal.cloud", rd.Name),
+				IngressRuleValue: v1beta1.IngressRuleValue{
+					HTTP: &v1beta1.HTTPIngressRuleValue{
+						Paths: []v1beta1.HTTPIngressPath{{
+							Backend: v1beta1.IngressBackend{
+								ServiceName: rd.Name,
+								ServicePort: intstr.FromInt(80),
+							},
+						}},
+					},
+				},
+			}},
+		},
+	}
 }
 
 type BuildWatcher struct {
@@ -484,6 +547,21 @@ func (bw *BuildWatcher) Watch() error {
 	return nil
 }
 
+func (bw *BuildWatcher) RefreshReviewDeployment() error {
+		var result ReviewDeployment
+
+		err := bw.rdClient.Get().
+		Resource(ReviewDeploymentResourcePath).
+		Namespace(api.NamespaceDefault).
+		Name(bw.rd.Name).Do().Into(&result)
+
+		if err != nil {
+			return err
+		}
+		bw.rd = &result
+		return nil
+}
+
 func (bw *BuildWatcher) HandleNewPodState(pod *apiv1.Pod) error {
 
 	// TODO: This should apparently be way less simple and use conditions
@@ -496,6 +574,11 @@ func (bw *BuildWatcher) HandleNewPodState(pod *apiv1.Pod) error {
 		return nil
 	case apiv1.PodSucceeded:
 		log.Printf("Build pod %v for review deployment %v succeeeded", bw.rd.Status.BuildPod, bw.rd.Name)
+		err := bw.RefreshReviewDeployment()
+		if err != nil {
+			log.Printf("Error refreshing review deployment %v: %v", bw.rd.Name, err)
+			return err
+		}
 		bw.rd.Status.Image = bw.rd.BuildJob().getBuildImageName()
 		updated, err := UpdateReviewDeployment(bw.rdClient, bw.rd)
 		if err != nil {
@@ -512,45 +595,116 @@ func (bw *BuildWatcher) HandleNewPodState(pod *apiv1.Pod) error {
 	return nil
 }
 
+func (h *eventHandler) CreateBuildPod(rd *ReviewDeployment) error {
+	toCreate := rd.BuildPod()
+	log.Printf("Creating build pod for %", rd.Name)
+	pod, err := h.clientset.CoreV1().Pods(api.NamespaceDefault).Create(toCreate)
 
+	if err != nil {
+		log.Printf("Error creating build pod: %v", err)
+		return err
+	}
 
-func (h *eventHandler) OnAdd(obj interface{}) {
-	rd := obj.(*ReviewDeployment)
-	fmt.Printf("[WATCH] OnAdd %s\n", rd.SelfLink)
+	log.Printf("Created build pod %v for review deployment %v", pod.Name, rd.Name)
+	// Update review deployment status.
+	rd.Status.BuildPod = pod.Name
 
+	_, err = UpdateReviewDeployment(h.rdClient, rd)
+	if err != nil {
+		log.Printf("Error updating review deployment %v: %v", rd.Name, err)
+	}
+	return nil
+}
+
+func (h *eventHandler) CreatePod(rd *ReviewDeployment) error {
+	toCreate := rd.Pod()
+	pod, err := h.clientset.CoreV1().Pods(api.NamespaceDefault).Create(toCreate)
+
+	if err != nil {
+		log.Printf("Error creating pod: %v", err)
+		return err
+	}
+
+	log.Printf("Created pod %v for review deployment %v", pod.Name, rd.Name)
+	// Update review deployment status.
+	rd.Status.Pod = pod.Name
+
+	_, err = UpdateReviewDeployment(h.rdClient, rd)
+	if err != nil {
+		log.Printf("Error updating review deployment %v: %v", rd.Name, err)
+	}
+	return nil
+}
+
+func (h *eventHandler) CreateIngress(rd *ReviewDeployment) error {
+	toCreate := rd.Ingress()
+	ingress, err := h.clientset.ExtensionsV1beta1().Ingresses(api.NamespaceDefault).Create(toCreate)
+
+	if err != nil {
+		log.Printf("Error creating ingress: %v", err)
+		return err
+	}
+
+	log.Printf("Created ingress %v for review deployment %v", ingress.Name, rd.Name)
+	// Update review deployment status.
+	rd.Status.Ingress = ingress.Name
+
+	_, err = UpdateReviewDeployment(h.rdClient, rd)
+	if err != nil {
+		log.Printf("Error updating review deployment %v: %v", rd.Name, err)
+	}
+	return nil
+}
+
+func (h *eventHandler) CreateService(rd *ReviewDeployment) error {
+	toCreate := rd.Service()
+	svc, err := h.clientset.CoreV1().Services(api.NamespaceDefault).Create(toCreate)
+
+	if err != nil {
+		log.Printf("Error creating service %v: %v", toCreate.Name, err)
+		return err
+	}
+
+	log.Printf("Created service %v for review deployment %v", svc.Name, rd.Name)
+	// Update review deployment status.
+	rd.Status.Service = svc.Name
+
+	_, err = UpdateReviewDeployment(h.rdClient, rd)
+	if err != nil {
+		log.Printf("Error updating review deployment %v: %v", rd.Name, err)
+	}
+	return nil
+}
+
+func (h *eventHandler) handleUpdatedReviewDeployment(rd *ReviewDeployment) {
 	if rd.Status.Image == "" && rd.Status.BuildPod == "" {
-		toCreate := NewBuildPod(rd)
-		log.Printf("Creating build pod: %v", *toCreate)
-		pod, err := h.clientset.CoreV1().Pods(api.NamespaceDefault).Create(toCreate)
-
+		err := h.CreateBuildPod(rd)
 		if err != nil {
-			log.Printf("Error creating build pod: %v", err)
-			return
+			log.Printf("Error creating build pod for %v: %v", rd.Name, err)
 		}
-		log.Printf("Created %v", pod.SelfLink)
-		// Update review deployment status.
-		rd.Status.BuildPod = pod.SelfLink
 
 		bw := BuildWatcher{
 			rd: rd,
 			clientset: h.clientset,
 			rdClient: h.rdClient,
 		}
-
-		updated, err := UpdateReviewDeployment(h.rdClient, rd)
-		if err != nil {
-			log.Printf("Couldn't update review deployment %v: %v", rd.Name, err)
-		} else {
-		// TODO(safety): unguarded change of bw.rd here. Fine for now but should be guarded by mutex. Switching order of this and the bw.Watch() call below will result in sadness.
-			bw.rd = updated
-		}
-
 		go bw.Watch()
-
-		log.Printf("updated %v", updated)
-	} else {
-		log.Printf("Already built: %v", rd.SelfLink)
+		return
+	} else if rd.Status.Image != "" && rd.Status.Ingress == ""  {
+		// TODO check properly here
+		// Being slighlty lazy with the check here, as we'll never have Pod set
+		// without also having the ingress and service set.
+		h.CreateIngress(rd)
+		h.CreateService(rd)
+		h.CreatePod(rd)
 	}
+}
+
+
+func (h *eventHandler) OnAdd(obj interface{}) {
+	rd := obj.(*ReviewDeployment)
+
+	h.handleUpdatedReviewDeployment(rd)
 }
 
 func UpdateReviewDeployment(c *rest.RESTClient, rd *ReviewDeployment) (*ReviewDeployment, error) {
@@ -571,17 +725,14 @@ func UpdateReviewDeployment(c *rest.RESTClient, rd *ReviewDeployment) (*ReviewDe
 
 // TODO we probably don't care about updates?
 // Maybe just use for state machine violation detection?
+// Actually simpler to manage image added here.
 func (h *eventHandler) OnUpdate(oldObj, newObj interface{}) {
-	oldRd := oldObj.(*ReviewDeployment)
 	newRd := newObj.(*ReviewDeployment)
-	if newRd.Status.Image == "" && newRd.Status.BuildPod == "" {
-		log.Printf("why did we get here? %v", oldRd.SelfLink)
-	}
+	h.handleUpdatedReviewDeployment(newRd)
 }
 
 func (h *eventHandler) OnDelete(obj interface{}) {
-	reviewDeployment := obj.(*ReviewDeployment)
-	fmt.Printf("[WATCH] OnDelete %s\n", reviewDeployment.SelfLink)
+	// reviewDeployment := obj.(*ReviewDeployment)
 }
 
 // Adapted from
