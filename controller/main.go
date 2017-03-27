@@ -148,6 +148,10 @@ type buildJob struct {
 	repo, zipURL, buildContextDir, imageName, imageTag string
 }
 
+func (b *buildJob) getBuildImageName() string {
+	return fmt.Sprintf("gcr.io/%v/%v:%v", CloudProject, b.imageName, b.imageTag)
+}
+
 func (b *buildJob) Pod() *apiv1.Pod {
 	initContainers, _ := json.Marshal([]apiv1.Container{
 		{
@@ -402,13 +406,12 @@ type eventHandler struct {
 	rdClient *rest.RESTClient
 }
 
-func NewBuildPod(rd *ReviewDeployment) *apiv1.Pod {
-	log.Printf("rd=%v", *rd)
+func (rd *ReviewDeployment) BuildJob() *buildJob {
 	var contextDir string
 	if rd.Spec.BuildContextDir != nil {
 		contextDir = *rd.Spec.BuildContextDir
 	}
-	b := buildJob{
+	return &buildJob{
 		repo: rd.Spec.Repo,
 		zipURL: fmt.Sprintf("https://github.com/%s/archive/%s.zip", rd.Spec.Repo, rd.Spec.Ref),
 		imageName: fmt.Sprintf(
@@ -419,6 +422,10 @@ func NewBuildPod(rd *ReviewDeployment) *apiv1.Pod {
 		imageTag: rd.Spec.Ref,
 		buildContextDir: contextDir,
 	}
+}
+
+func NewBuildPod(rd *ReviewDeployment) *apiv1.Pod {
+	b := rd.BuildJob()
 
 	pod := b.Pod()
 	if pod.Labels == nil {
@@ -428,6 +435,84 @@ func NewBuildPod(rd *ReviewDeployment) *apiv1.Pod {
 
 	return pod
 }
+
+type BuildWatcher struct {
+	rd *ReviewDeployment
+	clientset              *kubernetes.Clientset
+	rdClient *rest.RESTClient
+	w watch.Interface
+}
+
+func (bw *BuildWatcher) Watch() error {
+	requirement, err := labels.NewRequirement(
+			ReviewDeploymentLabel, selection.Equals, []string{bw.rd.Name})
+
+			if err != nil {
+				log.Printf("Bad label selector requirement: %v", err)
+			}
+
+	w, err := bw.clientset.
+	CoreV1().
+	Pods(api.NamespaceDefault).
+	Watch(metav1.ListOptions{
+		LabelSelector: labels.NewSelector().Add(*requirement).String()})
+	if err != nil {
+		return err
+	}
+
+	bw.w = w
+
+	for event := range bw.w.ResultChan() {
+		switch event.Type {
+		case watch.Added:
+				fallthrough
+		case watch.Modified:
+			pod, ok := event.Object.(*apiv1.Pod)
+			if !ok {
+				log.Printf("GOT WRONG OBJECT TYPE: %v", event.Object)
+			}
+			bw.HandleNewPodState(pod)
+			continue
+		case watch.Error:
+			// TODO: Should update rd to have error status?
+		case watch.Deleted:
+			// TODO: What happens here?
+		default:
+			log.Printf("GOT NONSENSE EVENT %v", event)
+		}
+	}
+	return nil
+}
+
+func (bw *BuildWatcher) HandleNewPodState(pod *apiv1.Pod) error {
+
+	// TODO: This should apparently be way less simple and use conditions
+	// and container statuses?
+	switch pod.Status.Phase {
+		// If not done yet, keep waiting.
+	case apiv1.PodPending:
+		fallthrough
+	case apiv1.PodRunning:
+		return nil
+	case apiv1.PodSucceeded:
+		log.Printf("Build pod %v for review deployment %v succeeeded", bw.rd.Status.BuildPod, bw.rd.Name)
+		bw.rd.Status.Image = bw.rd.BuildJob().getBuildImageName()
+		updated, err := UpdateReviewDeployment(bw.rdClient, bw.rd)
+		if err != nil {
+			log.Printf("Error updating review deployment %v after build: %v", bw.rd.Name, err)
+		}
+		bw.rd = updated
+		bw.w.Stop()
+	default:
+		log.Printf("Build pod %v for review deployment %v failed", bw.rd.Status.BuildPod, bw.rd.Name)
+		// UpdateTheRdBad()
+		bw.w.Stop()
+	}
+
+	return nil
+}
+
+
 
 func (h *eventHandler) OnAdd(obj interface{}) {
 	rd := obj.(*ReviewDeployment)
@@ -443,27 +528,49 @@ func (h *eventHandler) OnAdd(obj interface{}) {
 			return
 		}
 		log.Printf("Created %v", pod.SelfLink)
+		// Update review deployment status.
 		rd.Status.BuildPod = pod.SelfLink
 
-		var result ReviewDeployment
-
-		req := h.rdClient.Put().
-		Resource(ReviewDeploymentResourcePath).
-		Namespace(api.NamespaceDefault).
-		Name(rd.Name).
-		Body(rd)
-		err = req.Do().Into(&result)
-		if err != nil {
-			// TODO: Concurrency here.
-			log.Printf("SOMETHING WENT WRONG, %v", err)
+		bw := BuildWatcher{
+			rd: rd,
+			clientset: h.clientset,
+			rdClient: h.rdClient,
 		}
-		log.Printf("updated %v", result)
+
+		updated, err := UpdateReviewDeployment(h.rdClient, rd)
+		if err != nil {
+			log.Printf("Couldn't update review deployment %v: %v", rd.Name, err)
+		} else {
+		// TODO(safety): unguarded change of bw.rd here. Fine for now but should be guarded by mutex. Switching order of this and the bw.Watch() call below will result in sadness.
+			bw.rd = updated
+		}
+
+		go bw.Watch()
+
+		log.Printf("updated %v", updated)
 	} else {
 		log.Printf("Already built: %v", rd.SelfLink)
 	}
 }
 
+func UpdateReviewDeployment(c *rest.RESTClient, rd *ReviewDeployment) (*ReviewDeployment, error) {
+	var result ReviewDeployment
+
+	req := c.Put().
+	Resource(ReviewDeploymentResourcePath).
+	Namespace(api.NamespaceDefault).
+	Name(rd.Name).
+	Body(rd)
+	err := req.Do().Into(&result)
+	if err != nil {
+		// TODO(prod): Check for resource version change and retry.
+		return nil, err
+	}
+	return &result, nil
+}
+
 // TODO we probably don't care about updates?
+// Maybe just use for state machine violation detection?
 func (h *eventHandler) OnUpdate(oldObj, newObj interface{}) {
 	oldRd := oldObj.(*ReviewDeployment)
 	newRd := newObj.(*ReviewDeployment)
